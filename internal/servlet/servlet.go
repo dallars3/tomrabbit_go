@@ -7,6 +7,7 @@ package servlet
 
 import (
 	"net/http"
+	"sync"
 
 	"tomrabbit/internal/session"
 )
@@ -18,23 +19,39 @@ import (
 type Request struct {
 	*http.Request
 	ensureSession func() *session.Session
+
+	// once makes the first GetSession call resolve the session and every
+	// later call return the cached result. This is safe even when a Servlet
+	// fans out goroutines that call GetSession concurrently: callers block on
+	// the first resolution and then share one Session, and the provider runs
+	// exactly once.
+	once sync.Once
+	sess *session.Session
 }
 
-// NewRequest wraps a standard request. ensureSession is invoked at most once,
-// on the first GetSession call; it must return the caller's existing session
-// or start a new one (issuing the cookie as a side effect).
+// NewRequest wraps a standard request. ensureSession resolves the caller's
+// session on demand (returning the existing one or starting a new session and
+// issuing the cookie). It is invoked at most once; pass nil only in tests that
+// never call GetSession.
 func NewRequest(r *http.Request, ensureSession func() *session.Session) *Request {
 	return &Request{Request: r, ensureSession: ensureSession}
 }
 
 // GetSession returns the caller's session, creating one (and issuing
-// JSESSIONID) on first use within the request, mirroring
-// HttpServletRequest.getSession().
+// JSESSIONID) on first use, mirroring HttpServletRequest.getSession(). It is
+// safe to call concurrently from goroutines spawned while handling one
+// request; all calls return the same instance.
+//
+// It returns nil in two cases: the Request was built without a session
+// provider (test use), or the response had already been committed on a
+// request that carried no valid session cookie — a new identifier could no
+// longer be delivered, so no unreachable session is stored.
 func (r *Request) GetSession() *session.Session {
 	if r.ensureSession == nil {
 		return nil
 	}
-	return r.ensureSession()
+	r.once.Do(func() { r.sess = r.ensureSession() })
+	return r.sess
 }
 
 // Response is what a Servlet writes to. It embeds the standard library

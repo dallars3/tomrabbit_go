@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"tomrabbit/internal/pipeline"
 	"tomrabbit/internal/registry"
@@ -53,6 +54,35 @@ func New(webappsRoot string, reg *registry.Registry, sessions *session.Store) *C
 	return c
 }
 
+// trackedWriter records whether the response headers have already been
+// committed. Once committed, adding a Set-Cookie header is a silent no-op, so
+// the container must not mint a session it could no longer identify to the
+// client. It preserves http.Flusher so static range/streaming responses keep
+// working.
+type trackedWriter struct {
+	http.ResponseWriter
+	committed atomic.Bool
+}
+
+func (w *trackedWriter) WriteHeader(code int) {
+	w.committed.Store(true)
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *trackedWriter) Write(p []byte) (int, error) {
+	// The first Write implicitly commits status 200.
+	w.committed.Store(true)
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *trackedWriter) Flush() {
+	// Flushing also commits the headers.
+	w.committed.Store(true)
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // ServeHTTP implements http.Handler.
 func (c *Container) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	name, rest := splitContextPath(r.URL.Path)
@@ -62,49 +92,51 @@ func (c *Container) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tw := &trackedWriter{ResponseWriter: w}
+
 	// A session starts only when a Servlet asks for it (via req.GetSession).
 	// Static resources and 404s must not mint sessions: otherwise crawlers
 	// hitting static files would grow the session table without bound.
-	var (
-		sess     *session.Session
-		resolved bool
-	)
+	// Request memoizes the result with sync.Once, so this runs at most once
+	// even when the Servlet fans out concurrent GetSession calls.
 	ensureSession := func() *session.Session {
-		if resolved {
-			return sess
-		}
-		resolved = true
 		if cookie, err := r.Cookie(SessionCookieName); err == nil {
-			// Open looks up and slides the idle deadline in one locked step.
+			// Open looks up and slides the idle deadline in one session-locked
+			// step. The id already belongs to the client, so this session
+			// stays reachable even if the response happens to be committed.
 			if existing, live := c.sessions.Open(cookie.Value); live {
-				sess = existing
+				return existing
 			}
 		}
-		if sess == nil {
-			sess = c.sessions.Create()
-			http.SetCookie(w, &http.Cookie{
-				Name:     SessionCookieName,
-				Value:    sess.ID(),
-				Path:     "/",
-				HttpOnly: true,
-				SameSite: http.SameSiteLaxMode,
-			})
+		if tw.committed.Load() {
+			// Headers are already on the wire: a brand-new JSESSIONID could
+			// never be delivered, so any stored state would be unreachable.
+			// Return nil instead of leaving an orphaned session row.
+			return nil
 		}
+		sess := c.sessions.Create()
+		http.SetCookie(tw, &http.Cookie{
+			Name:     SessionCookieName,
+			Value:    sess.ID(),
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+		})
 		return sess
 	}
 
 	// Static resources win over Servlets, mirroring the Java version's
 	// file-exists check but with safe paths, real status codes and types.
-	if serveStatic(w, r, ctx.StaticDir, rest) {
+	if serveStatic(tw, r, ctx.StaticDir, rest) {
 		return
 	}
 
 	req := servlet.NewRequest(r, ensureSession)
-	resp := &servlet.Response{ResponseWriter: w}
+	resp := &servlet.Response{ResponseWriter: tw}
 	if ctx.Wrappers.Invoke(rest, resp, req) {
 		return
 	}
-	http.NotFound(w, r)
+	http.NotFound(tw, r)
 }
 
 // splitContextPath divides "/a/ccc" into ("a", "/ccc"). With no in-context
