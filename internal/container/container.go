@@ -1,6 +1,6 @@
 // Package container is TomRabbit's kernel: it owns the deployed Contexts and
-// routes every HTTP request to a Static Resource or a Servlet, attaching the
-// caller's Session along the way.
+// routes every HTTP request to a Static Resource or a Servlet, resolving the
+// caller's Session lazily only when a Servlet asks for it.
 //
 // It is a plain http.Handler (ADR-0002): net/http owns connection handling
 // and wire parsing, the container owns only Context/Wrapper/Pipeline routing.
@@ -62,7 +62,36 @@ func (c *Container) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess := c.resolveSession(w, r)
+	// A session starts only when a Servlet asks for it (via req.GetSession).
+	// Static resources and 404s must not mint sessions: otherwise crawlers
+	// hitting static files would grow the session table without bound.
+	var (
+		sess     *session.Session
+		resolved bool
+	)
+	ensureSession := func() *session.Session {
+		if resolved {
+			return sess
+		}
+		resolved = true
+		if cookie, err := r.Cookie(SessionCookieName); err == nil {
+			// Open looks up and slides the idle deadline in one locked step.
+			if existing, live := c.sessions.Open(cookie.Value); live {
+				sess = existing
+			}
+		}
+		if sess == nil {
+			sess = c.sessions.Create()
+			http.SetCookie(w, &http.Cookie{
+				Name:     SessionCookieName,
+				Value:    sess.ID(),
+				Path:     "/",
+				HttpOnly: true,
+				SameSite: http.SameSiteLaxMode,
+			})
+		}
+		return sess
+	}
 
 	// Static resources win over Servlets, mirroring the Java version's
 	// file-exists check but with safe paths, real status codes and types.
@@ -70,32 +99,12 @@ func (c *Container) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req := &servlet.Request{Request: r, Session: sess}
+	req := servlet.NewRequest(r, ensureSession)
 	resp := &servlet.Response{ResponseWriter: w}
 	if ctx.Wrappers.Invoke(rest, resp, req) {
 		return
 	}
 	http.NotFound(w, r)
-}
-
-// resolveSession returns the caller's existing, non-expired Session and slides
-// its deadline; otherwise it creates one and issues the cookie.
-func (c *Container) resolveSession(w http.ResponseWriter, r *http.Request) *session.Session {
-	if cookie, err := r.Cookie(SessionCookieName); err == nil {
-		if sess, ok := c.sessions.Get(cookie.Value); ok {
-			c.sessions.Touch(sess)
-			return sess
-		}
-	}
-	sess := c.sessions.Create()
-	http.SetCookie(w, &http.Cookie{
-		Name:     SessionCookieName,
-		Value:    sess.ID(),
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
-	return sess
 }
 
 // splitContextPath divides "/a/ccc" into ("a", "/ccc"). With no in-context

@@ -12,10 +12,29 @@ import (
 )
 
 // Request is what a Servlet receives. It embeds the standard library request
-// (per ADR-0002 net/http owns wire details) and adds the caller's Session.
+// (per ADR-0002 net/http owns wire details). A Session is not attached
+// eagerly: GetSession starts one only when the Servlet asks for it, so static
+// resources and unmatched paths never create sessions.
 type Request struct {
 	*http.Request
-	Session *session.Session
+	ensureSession func() *session.Session
+}
+
+// NewRequest wraps a standard request. ensureSession is invoked at most once,
+// on the first GetSession call; it must return the caller's existing session
+// or start a new one (issuing the cookie as a side effect).
+func NewRequest(r *http.Request, ensureSession func() *session.Session) *Request {
+	return &Request{Request: r, ensureSession: ensureSession}
+}
+
+// GetSession returns the caller's session, creating one (and issuing
+// JSESSIONID) on first use within the request, mirroring
+// HttpServletRequest.getSession().
+func (r *Request) GetSession() *session.Session {
+	if r.ensureSession == nil {
+		return nil
+	}
+	return r.ensureSession()
 }
 
 // Response is what a Servlet writes to. It embeds the standard library

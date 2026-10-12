@@ -17,12 +17,14 @@ func init() {
 // TestServlet greets the "name" query parameter and counts how many times the
 // caller's session has visited.
 func TestServlet(resp *servlet.Response, req *servlet.Request) {
-	visits := 0
-	if v, ok := req.Session.Get("visits"); ok {
-		visits = v.(int)
-	}
-	visits++
-	req.Session.Set("visits", visits)
+	var visits int
+	// Update runs the read-modify-write under one lock: concurrent requests on
+	// the same session cannot lose increments.
+	req.GetSession().Update("visits", func(v any) any {
+		visits, _ = v.(int)
+		visits++
+		return visits
+	})
 
 	name := req.URL.Query().Get("name")
 	if name == "" {

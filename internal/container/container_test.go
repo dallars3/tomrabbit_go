@@ -21,12 +21,12 @@ import (
 type visitServlet struct{}
 
 func (visitServlet) Service(resp *servlet.Response, req *servlet.Request) {
-	n := 0
-	if v, ok := req.Session.Get("visits"); ok {
-		n = v.(int)
-	}
-	n++
-	req.Session.Set("visits", n)
+	var n int
+	req.GetSession().Update("visits", func(v any) any {
+		n, _ = v.(int)
+		n++
+		return n
+	})
 	name := req.URL.Query().Get("name")
 	if name == "" {
 		name = "world"
@@ -262,5 +262,66 @@ func TestExpiredCookieStartsNewSession(t *testing.T) {
 	}
 	if body := readBody(t, second); body != "Hello, world! visits=1" {
 		t.Fatalf("expired session should restart at visits=1, body = %q", body)
+	}
+}
+
+// Regression for eager session creation: static files, 404s and Servlets that
+// never read the session must neither issue JSESSIONID nor grow the store.
+func TestSessionsAreCreatedLazily(t *testing.T) {
+	f := newFixture(t)
+	defer f.close()
+
+	client := &http.Client{} // no cookie jar: inspect raw Set-Cookie each time
+	for _, p := range []string{
+		"/a/1.html",  // existing static file
+		"/a/missing", // unmatched pattern inside a context -> 404
+		"/nope/x",    // unknown context -> 404
+		"/a/c1",      // Servlet that never calls GetSession
+	} {
+		resp := f.get(t, client, p)
+		readBody(t, resp)
+		if id := sessionCookie(resp); id != "" {
+			t.Errorf("%s: JSESSIONID issued without a Servlet asking (%q)", p, id)
+		}
+	}
+	if n := f.store.Len(); n != 0 {
+		t.Errorf("session store should stay empty, got %d sessions", n)
+	}
+
+	// A Servlet that uses the session is exactly where one is created.
+	resp := f.get(t, client, "/a/ccc")
+	if id := sessionCookie(resp); id == "" {
+		t.Fatal("session-using Servlet must get a JSESSIONID")
+	}
+	if n := f.store.Len(); n != 1 {
+		t.Fatalf("store should hold exactly one session, got %d", n)
+	}
+}
+
+// Static requests must not keep an idle session alive: they never touch the
+// session store, so a session idle past the TTL expires even when the client
+// keeps fetching static files with the cookie attached.
+func TestStaticRequestDoesNotSlideSession(t *testing.T) {
+	f := newFixture(t)
+	defer f.close()
+
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+
+	first := f.get(t, client, "/a/ccc")
+	id := sessionCookie(first)
+	readBody(t, first)
+
+	f.clock.t = f.clock.t.Add(25 * time.Minute) // 5 minutes left in the window
+	static := f.get(t, client, "/a/1.html")     // cookie is sent, must NOT slide
+	readBody(t, static)
+
+	f.clock.t = f.clock.t.Add(6 * time.Minute) // 31 minutes since creation
+	second := f.get(t, client, "/a/ccc")
+	if newID := sessionCookie(second); newID == "" || newID == id {
+		t.Fatalf("static fetch must not slide the session; old=%q reissued=%q", id, newID)
+	}
+	if body := readBody(t, second); body != "Hello, world! visits=1" {
+		t.Fatalf("session should have expired, body = %q", body)
 	}
 }

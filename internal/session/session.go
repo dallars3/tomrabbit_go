@@ -38,6 +38,15 @@ func (s *Session) Set(name string, value any) {
 	s.attrs[name] = value
 }
 
+// Update applies fn to the current attribute value (nil when absent) and
+// stores the result, all under one lock acquisition. Use it for read-modify-
+// write counters: separate Get/Set calls race and lose updates.
+func (s *Session) Update(name string, fn func(current any) any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.attrs[name] = fn(s.attrs[name])
+}
+
 // Delete removes an attribute.
 func (s *Session) Delete(name string) {
 	s.mu.Lock()
@@ -49,6 +58,26 @@ func (s *Session) lastAccessedAt() time.Time {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.lastAccess
+}
+
+// liveAt reports whether the session had been used within ttl at time now.
+func (s *Session) liveAt(now time.Time, ttl time.Duration) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return now.Sub(s.lastAccess) < ttl
+}
+
+// checkAndTouch returns false without changing anything when the session is
+// already idle past ttl at time now; otherwise it atomically slides the
+// access time to now.
+func (s *Session) checkAndTouch(now time.Time, ttl time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if now.Sub(s.lastAccess) >= ttl {
+		return false
+	}
+	s.lastAccess = now
+	return true
 }
 
 func (s *Session) touch(at time.Time) {
@@ -96,24 +125,58 @@ func (st *Store) Create() *Session {
 }
 
 // Get returns the session when the id exists and has not been idle past the
-// TTL. Expired sessions are deleted on sight.
+// TTL. It is a pure lookup: it never slides the access time. Expired sessions
+// are deleted on sight.
 func (st *Store) Get(id string) (*Session, bool) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	s, ok := st.items[id]
+	s, now, ok := st.find(id)
 	if !ok {
 		return nil, false
 	}
-	if st.now().Sub(s.lastAccessedAt()) >= st.ttl {
-		delete(st.items, id)
+	if s.liveAt(now, st.ttl) {
+		return s, true
+	}
+	st.evictExpired(id, now)
+	return nil, false
+}
+
+// Open returns the session for id and slides its access time in one step, so
+// a request that actually uses the session pays no extra Touch round-trip.
+// An unknown or expired id returns false and is evicted.
+func (st *Store) Open(id string) (*Session, bool) {
+	s, now, ok := st.find(id)
+	if !ok {
 		return nil, false
 	}
-	return s, true
+	if s.checkAndTouch(now, st.ttl) {
+		return s, true
+	}
+	st.evictExpired(id, now)
+	return nil, false
 }
 
 // Touch marks a session as used now, extending its sliding deadline.
 func (st *Store) Touch(s *Session) {
 	s.touch(st.now())
+}
+
+// find locates a session pointer under the read lock only; map entries are
+// deleted, never mutated in place, so the pointer stays valid afterwards.
+func (st *Store) find(id string) (*Session, time.Time, bool) {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	s, ok := st.items[id]
+	return s, st.now(), ok
+}
+
+// evictExpired deletes id only if it is still expired, re-checking under the
+// write lock because a concurrent Open could have touched it in between.
+func (st *Store) evictExpired(id string, now time.Time) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	s, ok := st.items[id]
+	if ok && !s.liveAt(now, st.ttl) {
+		delete(st.items, id)
+	}
 }
 
 // CleanExpired deletes every session idle for at least the TTL and returns how
@@ -124,7 +187,7 @@ func (st *Store) CleanExpired() int {
 	defer st.mu.Unlock()
 	removed := 0
 	for id, s := range st.items {
-		if now.Sub(s.lastAccessedAt()) >= st.ttl {
+		if !s.liveAt(now, st.ttl) {
 			delete(st.items, id)
 			removed++
 		}

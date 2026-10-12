@@ -14,7 +14,7 @@ func (m *marker) Service(resp *servlet.Response, req *servlet.Request) {
 }
 
 func newReq(path string) *servlet.Request {
-	return &servlet.Request{Request: httptest.NewRequest("GET", path, nil)}
+	return servlet.NewRequest(httptest.NewRequest("GET", path, nil), nil)
 }
 
 func TestBuildIsSortedForDeterminism(t *testing.T) {
