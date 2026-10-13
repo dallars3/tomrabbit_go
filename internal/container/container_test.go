@@ -112,7 +112,10 @@ func newFixture(t *testing.T) *fixture {
 	clock := &fakeClock{t: time.Unix(1_000_000, 0)}
 	store := session.NewStoreWithClock(30*time.Minute, clock.now)
 
-	c := New(root, reg, store)
+	c, err := New(root, reg, store)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &fixture{
 		server: httptest.NewServer(c),
 		store:  store,
@@ -243,7 +246,10 @@ func TestPathTraversalIsRejected(t *testing.T) {
 
 	// Drive the handler directly so the raw traversal path survives (an
 	// http.Client would clean the URL before sending).
-	c := New(f.root, f.reg, f.store)
+	c, err := New(f.root, f.reg, f.store)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, evil := range []string{
 		"/a/../../../../etc/passwd",
 		"/a/../secret.txt",
@@ -269,7 +275,11 @@ func TestUnrelatedCookiesAreTolerated(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/a/ccc", nil)
 	req.Header.Set("Cookie", "foo=bar; baz=qux")
-	New(f.root, f.reg, f.store).ServeHTTP(rec, req)
+	c2, err := New(f.root, f.reg, f.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)

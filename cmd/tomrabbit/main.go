@@ -34,7 +34,10 @@ func main() {
 	defer stop()
 	go store.StartCleanup(ctx, time.Minute)
 
-	handler := container.New(*webapps, registry.Default(), store)
+	handler, err := container.New(*webapps, registry.Default(), store)
+	if err != nil {
+		log.Fatalf("tomrabbit failed to start: %v", err)
+	}
 	addr := ":" + strconv.Itoa(*port)
 	conn := connector.New(addr, handler)
 
