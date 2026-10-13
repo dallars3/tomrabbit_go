@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,12 +22,12 @@ import (
 type visitServlet struct{}
 
 func (visitServlet) Service(resp *servlet.Response, req *servlet.Request) {
-	n := 0
-	if v, ok := req.Session.Get("visits"); ok {
-		n = v.(int)
-	}
-	n++
-	req.Session.Set("visits", n)
+	var n int
+	req.GetSession().Update("visits", func(v any) any {
+		n, _ = v.(int)
+		n++
+		return n
+	})
 	name := req.URL.Query().Get("name")
 	if name == "" {
 		name = "world"
@@ -38,6 +39,40 @@ type bodyServlet string
 
 func (b bodyServlet) Service(resp *servlet.Response, _ *servlet.Request) {
 	_, _ = resp.Write([]byte(b))
+}
+
+// fanServlet calls GetSession from many goroutines within one request: they
+// must all observe the same Session and the cookie must be issued exactly once.
+type fanServlet struct{}
+
+func (fanServlet) Service(resp *servlet.Response, req *servlet.Request) {
+	const n = 16
+	var wg sync.WaitGroup
+	got := make([]*session.Session, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			got[i] = req.GetSession()
+		}(i)
+	}
+	wg.Wait()
+	same := true
+	for _, s := range got {
+		if s != got[0] {
+			same = false
+		}
+	}
+	fmt.Fprintf(resp, "same=%v", same)
+}
+
+// lateServlet commits the response first and asks for the session afterwards.
+type lateServlet struct{}
+
+func (lateServlet) Service(resp *servlet.Response, req *servlet.Request) {
+	_, _ = resp.Write([]byte("committed"))
+	sess := req.GetSession()
+	fmt.Fprintf(resp, " sess=%v", sess != nil)
 }
 
 // ---- fixtures --------------------------------------------------------------
@@ -71,6 +106,8 @@ func newFixture(t *testing.T) *fixture {
 	reg.Register("a", "/c1", bodyServlet("one"))
 	reg.Register("a", "/c2", bodyServlet("two"))
 	reg.Register("a", "/c3", bodyServlet("three"))
+	reg.Register("a", "/fan", fanServlet{})
+	reg.Register("a", "/late", lateServlet{})
 
 	clock := &fakeClock{t: time.Unix(1_000_000, 0)}
 	store := session.NewStoreWithClock(30*time.Minute, clock.now)
@@ -262,5 +299,134 @@ func TestExpiredCookieStartsNewSession(t *testing.T) {
 	}
 	if body := readBody(t, second); body != "Hello, world! visits=1" {
 		t.Fatalf("expired session should restart at visits=1, body = %q", body)
+	}
+}
+
+// Regression for eager session creation: static files, 404s and Servlets that
+// never read the session must neither issue JSESSIONID nor grow the store.
+func TestSessionsAreCreatedLazily(t *testing.T) {
+	f := newFixture(t)
+	defer f.close()
+
+	client := &http.Client{} // no cookie jar: inspect raw Set-Cookie each time
+	for _, p := range []string{
+		"/a/1.html",  // existing static file
+		"/a/missing", // unmatched pattern inside a context -> 404
+		"/nope/x",    // unknown context -> 404
+		"/a/c1",      // Servlet that never calls GetSession
+	} {
+		resp := f.get(t, client, p)
+		readBody(t, resp)
+		if id := sessionCookie(resp); id != "" {
+			t.Errorf("%s: JSESSIONID issued without a Servlet asking (%q)", p, id)
+		}
+	}
+	if n := f.store.Len(); n != 0 {
+		t.Errorf("session store should stay empty, got %d sessions", n)
+	}
+
+	// A Servlet that uses the session is exactly where one is created.
+	resp := f.get(t, client, "/a/ccc")
+	if id := sessionCookie(resp); id == "" {
+		t.Fatal("session-using Servlet must get a JSESSIONID")
+	}
+	if n := f.store.Len(); n != 1 {
+		t.Fatalf("store should hold exactly one session, got %d", n)
+	}
+}
+
+// Static requests must not keep an idle session alive: they never touch the
+// session store, so a session idle past the TTL expires even when the client
+// keeps fetching static files with the cookie attached.
+func TestStaticRequestDoesNotSlideSession(t *testing.T) {
+	f := newFixture(t)
+	defer f.close()
+
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+
+	first := f.get(t, client, "/a/ccc")
+	id := sessionCookie(first)
+	readBody(t, first)
+
+	f.clock.t = f.clock.t.Add(25 * time.Minute) // 5 minutes left in the window
+	static := f.get(t, client, "/a/1.html")     // cookie is sent, must NOT slide
+	readBody(t, static)
+
+	f.clock.t = f.clock.t.Add(6 * time.Minute) // 31 minutes since creation
+	second := f.get(t, client, "/a/ccc")
+	if newID := sessionCookie(second); newID == "" || newID == id {
+		t.Fatalf("static fetch must not slide the session; old=%q reissued=%q", id, newID)
+	}
+	if body := readBody(t, second); body != "Hello, world! visits=1" {
+		t.Fatalf("session should have expired, body = %q", body)
+	}
+}
+
+// Regression for the unguarded ensureSession memoization: GetSession called
+// from goroutines fanned out inside one request must resolve the session once,
+// return the same pointer to every caller, and issue the cookie exactly once.
+func TestGetSessionIsSafeWithinOneRequest(t *testing.T) {
+	f := newFixture(t)
+	defer f.close()
+
+	resp := f.get(t, &http.Client{}, "/a/fan")
+	if body := readBody(t, resp); body != "same=true" {
+		t.Fatalf("all goroutines must see the same session, body = %q", body)
+	}
+	cookies := resp.Cookies()
+	if n := len(cookies); n != 1 {
+		t.Fatalf("exactly one JSESSIONID expected, got %d cookies", n)
+	}
+	if n := f.store.Len(); n != 1 {
+		t.Fatalf("exactly one session expected in the store, got %d", n)
+	}
+}
+
+// Regression for the post-commit orphan: after the response is committed, a
+// cookieless GetSession cannot deliver JSESSIONID, so it must not create a
+// store row that the client can never reach.
+func TestGetSessionAfterCommitDoesNotMintSession(t *testing.T) {
+	f := newFixture(t)
+	defer f.close()
+
+	resp := f.get(t, &http.Client{}, "/a/late")
+	if body := readBody(t, resp); body != "committed sess=false" {
+		t.Fatalf("late GetSession must return nil, body = %q", body)
+	}
+	if id := sessionCookie(resp); id != "" {
+		t.Fatalf("no JSESSIONID may be issued after commit, got %q", id)
+	}
+	if n := f.store.Len(); n != 0 {
+		t.Fatalf("committed response must leave no orphan session, got %d", n)
+	}
+}
+
+// An existing cookie session stays usable even when first touched after the
+// response is committed: the id is already known to the client, so writes are
+// still reachable and no new cookie is needed.
+func TestExistingSessionUsableAfterCommit(t *testing.T) {
+	f := newFixture(t)
+	defer f.close()
+
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+
+	first := f.get(t, client, "/a/ccc")
+	id := sessionCookie(first)
+	readBody(t, first)
+	if id == "" {
+		t.Fatal("setup: expected a session cookie")
+	}
+
+	second := f.get(t, client, "/a/late")
+	if body := readBody(t, second); body != "committed sess=true" {
+		t.Fatalf("existing session should be returned after commit, body = %q", body)
+	}
+	if reissued := sessionCookie(second); reissued != "" {
+		t.Fatalf("existing session must not be reissued, got %q", reissued)
+	}
+	if n := f.store.Len(); n != 1 {
+		t.Fatalf("the one existing session must be retained, got %d", n)
 	}
 }

@@ -31,7 +31,10 @@ domain only, not implementation.
 - **Session** — Server-side state attributed to one client across multiple
   requests, accessed only through the cookie that identifies it.
 - **JSESSIONID** — The cookie carrying a Session's identifier. Absence or expiry
-  of the cookie means a new Session is started.
+  of the cookie means a new Session is started, but only on demand: a Session
+  is created when a Servlet calls `Request.GetSession()`, never for static
+  resources, unmatched paths, or Servlets that do not use it.
 - **Sliding Expiry** — A Session is discarded after a period of idleness (time
-  since its last request), not after a fixed lifetime. Every request that uses the
-  Session resets the deadline.
+  since its last request), not after a fixed lifetime. Only a request that uses
+  the Session (`Store.Open`, i.e. a Servlet reading it) resets the deadline; a
+  plain lookup (`Store.Get`) and static requests do not.
