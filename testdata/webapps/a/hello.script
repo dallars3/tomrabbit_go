@@ -1,0 +1,17 @@
+// hello.script — an interpreted servlet (ADR-0003).
+// Dropping this file into the context directory deploys it at
+// /a/hello.script; the script is parsed once at startup and runs per request.
+// Changing its text does not require rebuilding the Go binary, only a restart.
+
+setHeader("Content-Type", "text/plain; charset=utf-8");
+
+string name;
+name = query("name");
+if (name == "") {
+    name = "stranger";
+}
+
+print("Hello, " + name + "!");
+print("method: " + method());
+print("path:   " + path());
+print("ua:     " + header("User-Agent"));

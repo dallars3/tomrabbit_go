@@ -11,6 +11,10 @@ domain only, not implementation.
   `/<context-name>/`. Two webapps never share a context name.
 - **Static Resource** — A file in the Webapp's directory (such as `1.html`) served
   verbatim when the request path names an existing file. Checked before Servlets.
+- **Script Servlet** — A Servlet deployed as interpreted source (a `*.script`
+  file) in the Webapp's directory rather than compiled into the server. Parsed
+  once at startup and re-executed per request; an exception to compile-time
+  deployment, scoped by ADR-0003.
 
 ## Request handling
 

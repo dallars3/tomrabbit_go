@@ -7,6 +7,7 @@
 package container
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 
 	"tomrabbit/internal/pipeline"
 	"tomrabbit/internal/registry"
+	"tomrabbit/internal/scripting"
 	"tomrabbit/internal/servlet"
 	"tomrabbit/internal/session"
 )
@@ -37,21 +39,32 @@ type Container struct {
 	sessions *session.Store
 }
 
-// New snapshots the registry into Contexts. Registration happens in package
-// init functions (ADR-0001), so by startup the registry is complete.
-func New(webappsRoot string, reg *registry.Registry, sessions *session.Store) *Container {
+// New snapshots the registry into Contexts. Go-servlet registration happens
+// in package init functions (ADR-0001); interpreted *.script servlets are
+// discovered from each context directory here (ADR-0003). A script parse
+// error aborts startup with a file-prefixed error; a script mapped onto an
+// existing pattern panics via registry.Register, like any duplicate mapping.
+func New(webappsRoot string, reg *registry.Registry, sessions *session.Store) (*Container, error) {
 	c := &Container{
 		contexts: make(map[string]*Context),
 		sessions: sessions,
 	}
 	for _, name := range reg.Contexts() {
+		ctxDir := filepath.Join(webappsRoot, filepath.FromSlash(name))
+		scripts, err := scripting.Discover(ctxDir, scripting.DefaultRunTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("context %s: %w", name, err)
+		}
+		for pattern, serv := range scripts {
+			reg.Register(name, pattern, serv)
+		}
 		c.contexts[name] = &Context{
 			Name:      name,
-			StaticDir: filepath.Join(webappsRoot, filepath.FromSlash(name)),
+			StaticDir: ctxDir,
 			Wrappers:  pipeline.BuildChain(reg.Mappings(name)),
 		}
 	}
-	return c
+	return c, nil
 }
 
 // trackedWriter records whether the response headers have already been
@@ -161,6 +174,10 @@ func serveStatic(w http.ResponseWriter, r *http.Request, dir, urlPath string) bo
 	rel = strings.TrimPrefix(rel, string(filepath.Separator))
 	if rel == "" || rel == "." {
 		rel = "index.html"
+	}
+	if scripting.IsScriptPath(rel) {
+		// Deployed scripts execute via ScriptServlet; never serve their source.
+		return false
 	}
 
 	full := filepath.Join(dir, rel)
